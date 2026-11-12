@@ -4,12 +4,14 @@ from pathlib import Path
 
 from PySide6.QtCore import QPoint, QPointF, QRect, QSize, Qt, QTimer, QVariantAnimation
 from PySide6.QtGui import QColor, QContextMenuEvent, QCursor, QMouseEvent, QPainter, QPixmap, QRegion
-from PySide6.QtWidgets import QApplication, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QMenu, QSlider, QWidget
+from PySide6.QtWidgets import QApplication, QGraphicsOpacityEffect, QMenu, QWidget
 
 from pocket_kitty.radial_menu import RadialMenu
 from pocket_kitty.effects import ActionEffects, AnimatedCat, SpeechBubble
 from pocket_kitty.sprites import SpriteLibrary
 from pocket_kitty.status import PetStatus, StatusPanel
+from pocket_kitty.resize_handle import ResizeHandle
+from pocket_kitty.companion import CompanionBehavior
 
 
 def load_cat_image(path: Path, maximum_size: QSize) -> QPixmap:
@@ -52,12 +54,15 @@ class PetWindow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
         self._drag_offset: QPoint | None = None
+        self._closing = False
+        self.speech_kind = None
         self._asset_path = asset_path
         self.sprites = SpriteLibrary(asset_path)
         self.current_state = 'Idle'
         self.status = PetStatus(self)
         self.status_panel = StatusPanel(self.status, self)
-        self._placing_status = False
+        self._status_side = 'right'
+        self._status_position_pending = False
         self.cat_scale = 100
         self._layout_ready = False
 
@@ -66,7 +71,7 @@ class PetWindow(QWidget):
         # Let mouse events reach the pet window, even over the image.
         self.cat_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         # Reserve the full radial footprint so revealing it never moves the cat.
-        self.setFixedSize(440, 472)
+        self.setFixedSize(320, 352)
         self._menu_active = False
         self._context_menu_open = False
         self._cat_region = QRegion()
@@ -76,34 +81,13 @@ class PetWindow(QWidget):
         self.menu.progress_changed.connect(self._update_input_region)
         self.menu.hidden.connect(self._menu_hidden)
         self.menu.action_selected.connect(self.perform_action)
-        self.size_control = QWidget(self)
-        self.size_control.setCursor(Qt.CursorShape.ArrowCursor)
-        self.size_control.setStyleSheet(
-            'QWidget { background: #fff5ef; color: #58475f; border-radius: 14px; }'
-            'QLabel { font: 9pt "Segoe UI"; }'
-            'QSlider::groove:horizontal { height: 5px; background: #e5d6e9; border-radius: 2px; }'
-            'QSlider::handle:horizontal { width: 13px; margin: -5px 0; background: #c29abb; border-radius: 6px; }'
-            'QSlider::sub-page:horizontal { background: #d4aecb; border-radius: 2px; }'
-        )
-        size_layout = QHBoxLayout(self.size_control)
-        size_layout.setContentsMargins(10, 3, 10, 3)
-        size_layout.setSpacing(7)
-        size_layout.addWidget(QLabel('Size', self.size_control))
-        self.size_slider = QSlider(Qt.Orientation.Horizontal, self.size_control)
-        self.size_slider.setRange(50, 125)
-        self.size_slider.setValue(100)
-        self.size_slider.setAccessibleName('Cat size')
-        self.size_slider.setToolTip('Cat size: 50% - 125%')
-        size_layout.addWidget(self.size_slider, 1)
-        self.size_value = QLabel('100%', self.size_control)
-        self.size_value.setFixedWidth(34)
-        size_layout.addWidget(self.size_value)
-        self.size_opacity = QGraphicsOpacityEffect(self.size_control)
-        self.size_control.setGraphicsEffect(self.size_opacity)
-        self.size_control.hide()
-        self.size_slider.valueChanged.connect(self.set_cat_scale)
-        self.size_slider.sliderPressed.connect(lambda: self.hide_timer.stop())
-        self.size_slider.sliderReleased.connect(self._finish_resize)
+        self.resize_handle = ResizeHandle(self)
+        self.size_opacity = QGraphicsOpacityEffect(self.resize_handle)
+        self.resize_handle.setGraphicsEffect(self.size_opacity)
+        self.resize_handle.hide()
+        self.resize_handle.scale_requested.connect(self.set_cat_scale)
+        self.resize_handle.drag_started.connect(lambda: self.hide_timer.stop())
+        self.resize_handle.drag_finished.connect(self._finish_resize)
         self.hide_timer = QTimer(self)
         self.hide_timer.setSingleShot(True)
         self.hide_timer.setInterval(300)
@@ -125,6 +109,8 @@ class PetWindow(QWidget):
         self.action_animation.finished.connect(self._finish_action)
         self.set_cat_image(asset_path)
         self.position_at_startup()
+        self.companion = CompanionBehavior(self)
+        QApplication.instance().aboutToQuit.connect(self.shutdown)
 
     def set_cat_image(self, path: Path) -> None:
         """Single image update point for future animation states."""
@@ -135,46 +121,47 @@ class PetWindow(QWidget):
         size_changed = self.cat_label.size() != pixmap.size()
         self.cat_label.setPixmap(pixmap)
         self.cat_label.setFixedSize(pixmap.size())
-        if not self.size_slider.isSliderDown() and (size_changed or not self._layout_ready):
+        if size_changed or not self._layout_ready:
             self._arrange_pet()
-        elif self.size_slider.isSliderDown():
-            # Keep the slider under the pointer throughout a drag. Reflow the
-            # surrounding menu on release; the image itself previews live.
-            center = self.menu.center.toPoint()
-            self.cat_label.move(center.x() - pixmap.width() // 2, center.y() - pixmap.height() // 2)
         self._cat_region = self.cat_label.visual_region()
         self._update_input_region()
 
     def set_cat_scale(self, percent: int) -> None:
-        self.cat_scale = max(50, min(125, percent))
-        self.size_value.setText(f'{self.cat_scale}%')
-        if self.size_slider.value() != self.cat_scale:
-            self.size_slider.setValue(self.cat_scale)
+        if self.current_state != 'Idle':
             return
+        self.cat_scale = max(50, min(125, percent))
+        self.resize_handle.setToolTip(f'{self.cat_scale}% - drag to resize Kitty and menu')
         self.set_cat_image(self._asset_path)
 
     def _arrange_pet(self) -> None:
         old_center = self.mapToGlobal(self.menu.center.toPoint())
         cat = self.cat_label.size()
-        self.setFixedSize(cat.width() + 200, cat.height() + 300)
-        center = QPointF(self.width() / 2, 106 + cat.height() / 2)
-        self.cat_label.move(100, 106)
-        self.size_control.setGeometry(self.width() // 2 - 95, cat.height() + 158, 190, 34)
-        self.message.setGeometry(self.width() // 2 - 119, cat.height() + 110, 238, 38)
-        self.menu.arrange(self.width(), self.height(), center)
+        scale = self.cat_scale / 100
+        self.setFixedSize(round(320 * scale), round(352 * scale))
+        self.cat_label.move(round(40 * scale), round(40 * scale))
+        center = QPointF(self.width() / 2, self.cat_label.y() + cat.height() / 2)
+        self.resize_handle.setGeometry(round(254 * scale), round(268 * scale), round(28 * scale), round(28 * scale))
+        self.message.fit_to_text(scale)
+        self.menu.arrange(self.width(), self.height(), center, scale)
         if self._layout_ready:
             self.move(old_center - center.toPoint())
-            self._keep_on_screen()
+            if not self.resize_handle.dragging:
+                self._keep_on_screen()
         self._layout_ready = True
         self.effects.setGeometry(self.rect())
         if self.status_panel.isVisible():
             self._position_status_panel()
+        if self.message.isVisible():
+            self._position_speech_bubble()
 
     def _finish_resize(self) -> None:
-        self._arrange_pet()
-        self._cat_region = QRegion(self.cat_label.pixmap().mask()).translated(self.cat_label.pos())
+        self._keep_on_screen()
+        if self.status_panel.isVisible():
+            self._position_status_panel()
+        self._cat_region = self.cat_label.visual_region()
         self._update_input_region()
         self._sync_hover()
+        self.companion.on_available()
 
     def position_at_startup(self) -> None:
         """Use the primary monitor's work area, leaving room for the taskbar."""
@@ -194,24 +181,31 @@ class PetWindow(QWidget):
             # Only narrow travel corridors catch input; unused desktop corners
             # stay outside the native window mask and remain click-through.
             center = self.menu.center.toPoint()
-            self._bridges = QRegion(QRect(center.x() - 10, 50, 20, self.height() - 100)).united(
-                QRegion(QRect(50, center.y() - 10, self.width() - 100, 20))
+            scale = self.cat_scale / 100
+            top = round(32 * scale)
+            corridor = max(8, round(16 * scale))
+            self._bridges = QRegion(QRect(center.x() - corridor // 2, top, corridor, self.height() - 2 * top)).united(
+                QRegion(QRect(top, center.y() - corridor // 2, self.width() - 2 * top, corridor))
             )
+            if not self.resize_handle.isHidden():
+                # A small path to the handle beside the right paw.
+                foot = self.resize_handle.geometry().center()
+                self._bridges = self._bridges.united(QRegion(QRect(center.x(), foot.y() - corridor // 2, foot.x() - center.x() + 1, corridor)))
             region = region.united(self._bridges)
             buttons_region = QRegion()
             for button in self.menu.buttons.values():
                 buttons_region = buttons_region.united(QRegion(button.geometry(), QRegion.RegionType.Ellipse))
-            self.menu.setMask(buttons_region)
+            if self.menu.mask() != buttons_region:
+                self.menu.setMask(buttons_region)
             region = region.united(buttons_region)
-        if hasattr(self, 'size_control') and not self.size_control.isHidden():
-            region = region.united(QRegion(self.size_control.geometry()))
+        if hasattr(self, 'resize_handle') and not self.resize_handle.isHidden():
+            region = region.united(QRegion(self.resize_handle.geometry()))
             self.size_opacity.setOpacity(self.menu.progress)
-        if hasattr(self, 'message') and not self.message.isHidden():
-            region = region.united(QRegion(self.message.geometry()))
         region = region.united(self.effects.visual_region())
-        self._interactive_region = region
-        self.setMask(region)
-        self.update()
+        if self._interactive_region != region:
+            self._interactive_region = region
+            self.setMask(region)
+            self.update()
 
     def paintEvent(self, event) -> None:
         # Windows layered windows hit-test nonzero alpha. These nearly invisible
@@ -231,7 +225,7 @@ class PetWindow(QWidget):
     def _sync_hover(self) -> None:
         if self._drag_offset is not None or self._context_menu_open:
             return
-        if self.size_slider.isSliderDown():
+        if self.resize_handle.dragging:
             self.hide_timer.stop()
             return
         point = self.mapFromGlobal(QCursor.pos())
@@ -247,11 +241,13 @@ class PetWindow(QWidget):
         self._keep_on_screen()
         self._menu_active = True
         self.menu.setEnabled(True)
-        self.size_control.show()
-        self.size_control.raise_()
+        self.resize_handle.show()
+        self.resize_handle.raise_()
         self.menu.reveal(True)
         self._update_input_region()
         self.hover_timer.start()
+        if self.message.isVisible():
+            self._position_speech_bubble()
 
     def _hide_menu(self) -> None:
         self._menu_active = False
@@ -259,12 +255,12 @@ class PetWindow(QWidget):
 
     def _hide_if_outside(self) -> None:
         # Recheck at the deadline in case the cursor returned between polls.
-        if not self.size_slider.isSliderDown() and not self._interactive_region.contains(self.mapFromGlobal(QCursor.pos())):
+        if not self.resize_handle.dragging and not self._interactive_region.contains(self.mapFromGlobal(QCursor.pos())):
             self._hide_menu()
 
     def _menu_hidden(self) -> None:
         self.hover_timer.stop()
-        self.size_control.hide()
+        self.resize_handle.hide()
         self._update_input_region()
 
     def _keep_on_screen(self, desired: QPoint | None = None) -> None:
@@ -273,20 +269,41 @@ class PetWindow(QWidget):
         if screen is None:
             return
         area = screen.availableGeometry().adjusted(8, 8, -8, -8)
+        if self.status_panel.isVisible() and area.width() >= self.width() + self.status_panel.width() + 12:
+            reserved = self.status_panel.width() + 12
+            if self._status_side == 'right':
+                area.adjust(0, 0, -reserved, 0)
+            else:
+                area.adjust(reserved, 0, 0, 0)
+
         self.move(
             max(area.left(), min(desired.x(), area.right() + 1 - self.width())),
             max(area.top(), min(desired.y(), area.bottom() + 1 - self.height())),
         )
+        if self.status_panel.isVisible():
+            self._position_status_panel()
 
     def perform_action(self, action: str) -> bool:
         if action == 'Status':
-            self.status_panel.show()
-            self._position_status_panel()
-            self.status_panel.raise_()
+            if self.status_panel.isVisible():
+                self.status_panel.close()
+            else:
+                screen = QApplication.screenAt(self.mapToGlobal(self.cat_label.geometry().center())) or QApplication.primaryScreen()
+                if screen:
+                    area = screen.availableGeometry()
+                    left = self.x() - area.left()
+                    right = area.right() + 1 - self.x() - self.width()
+                    self._status_side = 'right' if right >= left else 'left'
+                self.status_panel.show()
+                self._keep_on_screen()
+                self._position_status_panel()
+                self.status_panel.raise_()
             return True
         if self.current_state != 'Idle' or action not in self.ACTIONS:
             return False
         duration, text = self.ACTIONS[action]
+        self.companion.action_started()
+        self.cat_label.begin_action()
         self.current_state = action
         self.cat_label.action = action
         self.cat_label.progress = 0.0
@@ -294,10 +311,8 @@ class PetWindow(QWidget):
         self.status.apply(action)
         for name, button in self.menu.buttons.items():
             button.setEnabled(name == 'Status')
-        self.size_control.setEnabled(False)
-        self.message.setText(text)
-        self.message.show()
-        self.message.raise_()
+        self.resize_handle.setEnabled(False)
+        self.show_speech(text, 'action')
         self.action_animation.setDuration(duration)
         self._advance_action(0.0)
         self.action_animation.start()
@@ -316,48 +331,128 @@ class PetWindow(QWidget):
         self.current_state = 'Idle'
         self.cat_label.action = None
         self.cat_label.progress = 0.0
+        self.cat_label.idle_pixmap = None
+        self.cat_label.idle_region = QRegion()
         self.effects.advance(None, 0.0, self.cat_label.geometry())
-        self.message.hide()
+        self.hide_speech()
         self.set_cat_image(self.sprites.paths['Idle'])
         for button in self.menu.buttons.values():
             button.setEnabled(True)
-        self.size_control.setEnabled(True)
+        self.resize_handle.setEnabled(True)
         self._update_input_region()
+        self.companion.on_available()
+
+    def show_speech(self, text: str, kind: str) -> None:
+        self.speech_kind = kind
+        self.message.setText(text)
+        self.message.fit_to_text(self.cat_scale / 100)
+        self._position_speech_bubble()
+        self.message.reveal()
+        self.message.raise_()
+
+    def hide_speech(self, animated=False) -> None:
+        self.speech_kind = None
+        self.message.dismiss(animated)
 
     def _position_status_panel(self) -> None:
-        if self._placing_status:
+        # Position only the panel here. Moving the pet from its own moveEvent
+        # can cause a native move/resize feedback loop on Windows.
+        self._status_position_pending = False
+        if self._closing or not self.status_panel.isVisible() or self.resize_handle.dragging:
             return
         screen = QApplication.screenAt(self.mapToGlobal(self.cat_label.geometry().center())) or QApplication.primaryScreen()
         if screen is None:
             return
-        self._placing_status = True
-        try:
-            area = screen.availableGeometry().adjusted(8, 8, -8, -8)
-            gap = 12
-            width = self.status_panel.width()
-            left_space = self.x() - area.left()
-            right_space = area.right() + 1 - self.x() - self.width()
-            on_right = right_space >= width + gap or right_space >= left_space
-            if max(left_space, right_space) < width + gap and area.width() >= self.width() + width + gap:
-                # Make room beside the whole radial footprint, not on the cat.
-                x = area.right() + 1 - self.width() - width - gap if on_right else area.left() + width + gap
-                self.move(x, self.y())
-            x = self.x() + self.width() + gap if on_right else self.x() - width - gap
-            x = max(area.left(), min(x, area.right() + 1 - width))
-            y = max(area.top(), min(self.y() + self.cat_label.y(), area.bottom() + 1 - self.status_panel.height()))
-            self.status_panel.move(x, y)
-        finally:
-            self._placing_status = False
+        area = screen.availableGeometry().adjusted(8, 8, -8, -8)
+        gap = 12
+        width = self.status_panel.width()
+        x = self.x() + self.width() + gap if self._status_side == 'right' else self.x() - width - gap
+        x = max(area.left(), min(x, area.right() + 1 - width))
+        y = max(area.top(), min(self.y() + self.cat_label.y(), area.bottom() + 1 - self.status_panel.height()))
+        position = QPoint(x, y)
+        if self.status_panel.pos() != position:
+            self.status_panel.move(position)
+        if self.message.isVisible():
+            self._position_speech_bubble()
+
+    def _position_speech_bubble(self) -> None:
+        if self._closing:
+            return
+        screen = QApplication.screenAt(self.mapToGlobal(self.cat_label.geometry().center())) or QApplication.primaryScreen()
+        if screen is None:
+            return
+        area = screen.availableGeometry().adjusted(8, 8, -8, -8)
+        cat = QRect(self.mapToGlobal(self.cat_label.pos()), self.cat_label.size())
+        width, height = self.message.width(), self.message.height()
+        gap = round(46 * self.cat_scale / 100)
+        y = max(area.top(), cat.top() - height - 8)
+        obstacles = [QRect(self.menu.mapToGlobal(button.pos()), button.size())
+                     for button in self.menu.buttons.values()] if not self.menu.isHidden() else []
+        if self.status_panel.isVisible():
+            obstacles.append(self.status_panel.geometry())
+        candidates = [(cat.center().x() - width - gap, 'right'), (cat.center().x() + gap, 'left')]
+        # Side positions are useful when the monitor's top edge leaves too
+        # little headroom. Keep bubbles clear of the entire image frame.
+        candidates.extend([(cat.left() - width - 12, 'right'), (cat.right() + 12, 'left'),
+                           (self.x() - width - 12, 'right'), (self.x() + self.width() + 12, 'left')])
+        if self.status_panel.isVisible():
+            panel = self.status_panel.geometry()
+            candidates.extend([(panel.right() + 12, 'left'), (panel.left() - width - 12, 'right')])
+        # Prefer upper-left; flip to upper-right near the left screen edge.
+        for x, tail in candidates:
+            rect = QRect(x, y, width, height)
+            if area.contains(rect) and not rect.intersects(cat) and not any(rect.intersects(item) for item in obstacles):
+                self.message.tail_side = tail
+                self.message.tail_above = False
+                self.message.move(rect.topLeft())
+                self.message.update()
+                return
+        # At tight top corners a status panel can occupy the only free side.
+        # Search clear space above/below the group before using a clamped fallback.
+        rows = [self.y() - height - 8, self.y() + self.height() + 8]
+        if self.status_panel.isVisible():
+            rows.extend([panel.top() - height - 8, panel.bottom() + 12])
+        columns = [x for x, _ in candidates] + [area.left(), area.right() + 1 - width]
+        for row in rows:
+            for column in columns:
+                rect = QRect(column, row, width, height)
+                if area.contains(rect) and not rect.intersects(cat) and not any(rect.intersects(item) for item in obstacles):
+                    self.message.tail_side = 'right' if rect.center().x() < cat.center().x() else 'left'
+                    self.message.tail_above = rect.center().y() > cat.center().y()
+                    self.message.move(rect.topLeft())
+                    self.message.update()
+                    return
+        x = max(area.left(), min(candidates[0][0], area.right() + 1 - width))
+        self.message.tail_side = 'right'
+        self.message.tail_above = False
+        self.message.move(x, max(area.top(), self.y() - height - 8))
+        self.message.update()
 
     def moveEvent(self, event) -> None:
-        if hasattr(self, 'status_panel') and self.status_panel.isVisible():
-            self._position_status_panel()
+        if hasattr(self, 'status_panel') and self.status_panel.isVisible() and not self._status_position_pending:
+            self._status_position_pending = True
+            QTimer.singleShot(0, self._position_status_panel)
+        if hasattr(self, 'message') and self.message.isVisible():
+            self._position_speech_bubble()
         super().moveEvent(event)
 
     def closeEvent(self, event) -> None:
-        self.action_animation.stop()
-        self.status_panel.close()
+        self.shutdown()
         super().closeEvent(event)
+
+    def shutdown(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        self.companion.stop()
+        self.hide_timer.stop()
+        self.hover_timer.stop()
+        self.action_animation.stop()
+        self.menu.animation.stop()
+        for button in self.menu.buttons.values():
+            button._hover_animation.stop()
+        self.hide_speech()
+        self.status_panel.close()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton and self._cat_region.contains(event.position().toPoint()):
@@ -382,19 +477,34 @@ class PetWindow(QWidget):
             self._drag_offset = None
             self.setCursor(Qt.CursorShape.OpenHandCursor)
             self._sync_hover()
+            self.companion.on_available()
             event.accept()
         else:
             super().mouseReleaseEvent(event)
 
-    def contextMenuEvent(self, event: QContextMenuEvent) -> None:
-        """Keep menu creation separate so more actions can be added later."""
-        self._context_menu_open = True
-        self.hide_timer.stop()
+    def create_context_menu(self) -> QMenu:
         menu = QMenu(self)
+        menu.setStyleSheet(
+            'QMenu { background: #fff8f5; color: #58475f; border: 1px solid #e5d2e1; padding: 5px; }'
+            'QMenu::item { padding: 7px 18px; border-radius: 6px; }'
+            'QMenu::item:selected { background: #f6dfeb; }'
+        )
         exit_action = menu.addAction("Exit")
         exit_action.triggered.connect(QApplication.quit)
+        menu.addSeparator()
+        demo_action = menu.addAction('Demo Mode')
+        demo_action.setCheckable(True)
+        demo_action.setChecked(self.companion.demo_mode)
+        demo_action.toggled.connect(self.companion.set_demo_mode)
+        return menu
+
+    def contextMenuEvent(self, event: QContextMenuEvent) -> None:
+        self._context_menu_open = True
+        self.hide_timer.stop()
+        menu = self.create_context_menu()
         menu.exec(event.globalPos())
         menu.deleteLater()
         self._context_menu_open = False
         self._sync_hover()
+        self.companion.on_available()
         event.accept()

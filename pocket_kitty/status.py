@@ -6,11 +6,11 @@ from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QProgressBar, QPushBu
 
 class PetStatus(QObject):
     changed = Signal()
-    DELTAS = {'Feed': (-25, 5, 0), 'Pat': (0, 15, 0), 'Play': (5, 20, -15)}
+    DELTAS = {'Feed': (25, 5, 0), 'Pat': (0, 15, 0), 'Play': (-5, 20, -15)}
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.values = {'Hunger': 35, 'Happiness': 65, 'Energy': 75}
+        self.values = {'Fullness': 65, 'Happiness': 65, 'Energy': 75}
 
     def apply(self, action: str) -> None:
         for key, delta in zip(self.values, self.DELTAS[action]):
@@ -55,7 +55,8 @@ class StatusPanel(QWidget):
         self.percentages = {}
         for key, color in zip(status.values, ('#efba89', '#e9a5c6', '#a3d9c3')):
             row = QHBoxLayout()
-            row.addWidget(QLabel(key, card))
+            label = 'Hungry' if key == 'Fullness' else key
+            row.addWidget(QLabel(label, card))
             number = QLabel(card)
             number.setAlignment(Qt.AlignmentFlag.AlignRight)
             row.addWidget(number)
@@ -64,7 +65,7 @@ class StatusPanel(QWidget):
             bar.setRange(0, 100)
             bar.setTextVisible(False)
             bar.setFixedHeight(10)
-            bar.setAccessibleName(key)
+            bar.setAccessibleName(label)
             bar.setStyleSheet(
                 'QProgressBar { background: #efe8ec; border: none; border-radius: 5px; }'
                 f'QProgressBar::chunk {{ background: {color}; border-radius: 5px; }}'

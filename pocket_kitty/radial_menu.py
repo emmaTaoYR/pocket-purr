@@ -42,13 +42,14 @@ class RadialButton(QAbstractButton):
     def hitButton(self, position) -> bool:
         center = QPointF(self.width() / 2, self.height() / 2)
         delta = QPointF(position) - center
-        return delta.x() ** 2 + delta.y() ** 2 <= 43 ** 2
+        return delta.x() ** 2 + delta.y() ** 2 <= (self.width() * 0.43) ** 2
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setOpacity(self.reveal * (1.0 if self.isEnabled() else 0.48))
-        painter.translate(self.width() / 2, self.height() / 2)
+        painter.scale(self.width() / 100, self.height() / 100)
+        painter.translate(50, 50)
         scale = 0.92 + 0.08 * self.reveal + 0.025 * self.hover
         painter.scale(scale, scale)
         painter.translate(-50, -50 - self.hover)
@@ -71,7 +72,7 @@ class RadialButton(QAbstractButton):
         self._paint_icon(painter)
         painter.restore()
         painter.setPen(QColor('#58475f'))
-        painter.setFont(QFont('Segoe UI', 10, QFont.Weight.DemiBold))
+        painter.setFont(QFont('Segoe UI', 15, QFont.Weight.DemiBold))
         painter.drawText(QRectF(8, 60, 84, 23), Qt.AlignmentFlag.AlignCenter, self.text())
 
     def _paint_icon(self, painter: QPainter) -> None:
@@ -122,13 +123,14 @@ class RadialMenu(QWidget):
     action_selected = Signal(str)
     progress_changed = Signal()
     hidden = Signal()
-    CENTERS = {'Feed': (220, 50), 'Pat': (50, 236), 'Play': (390, 236), 'Status': (220, 422)}
+    CENTERS = {'Feed': (160, 32), 'Pat': (32, 169), 'Play': (288, 169), 'Status': (160, 320)}
 
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent)
-        self.setGeometry(0, 0, 440, 472)
+        self.setGeometry(0, 0, 320, 352)
         self.progress = 0.0
-        self.center = QPointF(220, 236)
+        self.button_size = 64
+        self.center = QPointF(160, 169)
         self.centers = dict(self.CENTERS)
         self.buttons = {}
         colors = ['#daedf8', '#fbe0eb', '#fce5d8', '#fff0ca']
@@ -143,15 +145,16 @@ class RadialMenu(QWidget):
         self._set_progress(0.0)
         self.hide()
 
-    def arrange(self, width: int, height: int, center: QPointF) -> None:
+    def arrange(self, width: int, height: int, center: QPointF, scale: float = 1.0) -> None:
         """Keep the same four directions when the user resizes the cat."""
         self.setGeometry(0, 0, width, height)
         self.center = center
+        self.button_size = round(64 * scale)
         self.centers = {
-            'Feed': (center.x(), 50),
-            'Pat': (50, center.y()),
-            'Play': (width - 50, center.y()),
-            'Status': (center.x(), height - 50),
+            'Feed': (center.x(), 32 * scale),
+            'Pat': (32 * scale, center.y()),
+            'Play': (width - 32 * scale, center.y()),
+            'Status': (center.x(), height - 32 * scale),
         }
         self._set_progress(self.progress)
 
@@ -160,7 +163,8 @@ class RadialMenu(QWidget):
         for name, button in self.buttons.items():
             x, y = self.centers[name]
             expansion = 0.94 + 0.06 * value
-            button.setGeometry(round(self.center.x() + (x - self.center.x()) * expansion - 50), round(self.center.y() + (y - self.center.y()) * expansion - 50), 100, 100)
+            half = self.button_size / 2
+            button.setGeometry(round(self.center.x() + (x - self.center.x()) * expansion - half), round(self.center.y() + (y - self.center.y()) * expansion - half), self.button_size, self.button_size)
             button.reveal = value
             button.update()
         self.progress_changed.emit()

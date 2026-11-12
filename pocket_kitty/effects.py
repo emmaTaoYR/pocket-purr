@@ -2,8 +2,8 @@
 
 import math
 
-from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QRegion, QTransform
+from PySide6.QtCore import QEasingCurve, QPointF, QRect, QRectF, Qt, QVariantAnimation
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPen, QRegion, QTransform
 from PySide6.QtWidgets import QLabel, QWidget
 
 
@@ -13,6 +13,22 @@ class AnimatedCat(QLabel):
         self.action = None
         self.progress = 0.0
         self.base_region = QRegion()
+        self.idle_seconds = 0.0
+        self.float_amount = 0.0
+        self.idle_pixmap = None
+        self.idle_region = QRegion()
+
+    def begin_action(self):
+        self.idle_pixmap = self.pixmap()
+        self.idle_region = QRegion(self.base_region)
+
+    def action_blend(self):
+        if self.action is None:
+            return 0.0
+        def ease(value):
+            value = max(0.0, min(1.0, value))
+            return value * value * (3 - 2 * value)
+        return ease(self.progress / 0.1) * ease((1 - self.progress) / 0.1)
 
     def setPixmap(self, pixmap):
         super().setPixmap(pixmap)
@@ -20,26 +36,31 @@ class AnimatedCat(QLabel):
 
     def frame_transform(self) -> QTransform:
         transform = QTransform()
-        if self.action is None:
-            return transform
-        wave = math.sin(self.progress * math.pi * 6)
+        blend = self.action_blend()
+        breath = math.sin(self.idle_seconds * math.pi * 2 / 5.5) * (1 - blend)
         transform.translate(self.width() / 2, self.height() * 0.92)
+        transform.translate(0, -1.6 * self.float_amount * (self.width() / 240) * (1 - blend))
+        transform.scale(1 + 0.0015 * breath, 1 + 0.0035 * breath)
+        wave = math.sin(self.progress * math.pi * 6)
         if self.action == 'Feed':
-            chew = math.sin(max(0, self.progress - 0.45) * math.pi * 14)
+            chew = math.sin(max(0, self.progress - 0.45) * math.pi * 14) * blend
             transform.translate(0, -abs(chew) * 2)
             transform.scale(1 + chew * 0.012, 1 - chew * 0.012)
         elif self.action == 'Pat':
-            bounce = wave ** 2
+            bounce = wave ** 2 * blend
             transform.translate(0, -bounce * 4)
             transform.scale(1 + bounce * 0.018, 1 - bounce * 0.018)
         elif self.action == 'Play':
-            transform.translate(wave * 3, 0)
-            transform.rotate(wave * 2.3)
+            transform.translate(wave * 3 * blend, 0)
+            transform.rotate(wave * 2.3 * blend)
         transform.translate(-self.width() / 2, -self.height() * 0.92)
         return transform
 
     def visual_region(self) -> QRegion:
-        return self.frame_transform().map(self.base_region).translated(self.pos())
+        region = self.base_region
+        if self.action is not None:
+            region = region.united(self.idle_region)
+        return self.frame_transform().map(region).translated(self.pos())
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -47,25 +68,91 @@ class AnimatedCat(QLabel):
         painter.setTransform(self.frame_transform())
         pixmap = self.pixmap()
         if pixmap and not pixmap.isNull():
+            if self.action is not None and self.idle_pixmap is not None:
+                blend = self.action_blend()
+                painter.setOpacity(1 - blend)
+                painter.drawPixmap(0, 0, self.idle_pixmap)
+                painter.setOpacity(blend)
             painter.drawPixmap(0, 0, pixmap)
 
 
 class SpeechBubble(QLabel):
+    def __init__(self, parent):
+        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
+                         | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.WindowTransparentForInput)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.tail_side = 'right'
+        self.tail_above = False
+        self.opacity = 1.0
+        self.fade = QVariantAnimation(self)
+        self.fade.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.fade.valueChanged.connect(self._set_opacity)
+        self.fade.finished.connect(self._fade_finished)
+
+    def fit_to_text(self, scale=1.0):
+        self.setFont(QFont('Segoe UI', max(9, min(11, round(10 * scale)))))
+        metrics = QFontMetrics(self.font())
+        maximum = max(210, min(280, round(240 * scale)))
+        width = min(maximum, max(160, metrics.horizontalAdvance(self.text()) + 32))
+        bounds = metrics.boundingRect(QRect(0, 0, width - 28, 1000),
+                                      Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, self.text())
+        self.setFixedSize(width, max(46, bounds.height() + 28))
+
+    def _set_opacity(self, value):
+        self.opacity = value
+        self.update()
+
+    def reveal(self):
+        was_hidden = self.isHidden()
+        self.fade.stop()
+        if was_hidden:
+            self.opacity = 0.0
+        self.show()
+        self.fade.setDuration(160)
+        self.fade.setStartValue(self.opacity)
+        self.fade.setEndValue(1.0)
+        self.fade.start()
+
+    def dismiss(self, animated=False):
+        self.fade.stop()
+        if not animated:
+            self.hide()
+            return
+        self.fade.setDuration(160)
+        self.fade.setStartValue(self.opacity)
+        self.fade.setEndValue(0.0)
+        self.fade.start()
+
+    def _fade_finished(self):
+        if self.opacity == 0:
+            self.hide()
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QPen(QColor('#e9d7dc'), 1))
-        painter.setBrush(QColor('#fff7ee'))
+        painter.setOpacity(self.opacity)
         path = QPainterPath()
-        path.addRoundedRect(QRectF(1, 6, self.width() - 2, self.height() - 7), 14, 14)
-        tail = QPainterPath(QPointF(self.width() / 2 - 6, 7))
-        tail.lineTo(self.width() / 2 + 1, 0)
-        tail.lineTo(self.width() / 2 + 7, 7)
+        path.addRoundedRect(QRectF(4, 13 if self.tail_above else 3, self.width() - 8, self.height() - 18), 14, 14)
+        x = self.width() - 30 if self.tail_side == 'right' else 30
+        tip = x + 16 if self.tail_side == 'right' else x - 16
+        base_y = 16 if self.tail_above else self.height() - 17
+        tip_y = 4 if self.tail_above else self.height() - 5
+        tail = QPainterPath(QPointF(x - 8, base_y))
+        tail.lineTo(tip, tip_y)
+        tail.lineTo(x + 8, base_y)
+        tail.closeSubpath()
         path = path.united(tail)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(80, 55, 80, 17))
+        painter.drawPath(path.translated(0, 3))
+        painter.setPen(QPen(QColor('#e9d7dc'), 0.8))
+        painter.setBrush(QColor('#fff7ee'))
         painter.drawPath(path)
         painter.setPen(QColor('#58475f'))
-        painter.setFont(QFont('Segoe UI', 10))
-        painter.drawText(QRectF(8, 7, self.width() - 16, self.height() - 8), Qt.AlignmentFlag.AlignCenter, self.text())
+        painter.setFont(self.font())
+        painter.drawText(QRectF(14, 15 if self.tail_above else 5, self.width() - 28, self.height() - 24),
+                         Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, self.text())
 
 
 def draw_effect(painter: QPainter, kind: str) -> None:

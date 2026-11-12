@@ -43,9 +43,16 @@ class PetInteractions(unittest.TestCase):
 
     def open_menu(self):
         self.point_at(self.pet.cat_label.geometry().center())
-        QTest.qWait(220)
+        self.wait_for_menu()
         self.assertTrue(self.pet._menu_active)
         self.assertAlmostEqual(self.pet.menu.progress, 1.0)
+
+    def wait_for_menu(self):
+        for _ in range(50):
+            if self.pet.menu.progress == 1.0:
+                return
+            QTest.qWait(20)
+        self.fail('The hover menu did not finish opening within one second')
 
     def test_window_and_asset_preserved(self):
         self.assertTrue(self.pet.windowFlags() & Qt.WindowType.WindowStaysOnTopHint)
@@ -92,7 +99,7 @@ class PetInteractions(unittest.TestCase):
         self.point_at(QPoint(-20, -20))
         QTest.qWait(340)
         self.point_at(self.pet.cat_label.geometry().center())
-        QTest.qWait(220)
+        self.wait_for_menu()
         self.assertAlmostEqual(self.pet.menu.progress, 1.0)
 
     def test_transparent_corners_and_menu_clamping(self):
@@ -138,13 +145,13 @@ class PetInteractions(unittest.TestCase):
     def test_resize_preserves_aspect_ratio_and_menu_bounds(self):
         self.open_menu()
         for percent in (50, 125, 100):
-            self.pet.size_slider.setValue(percent)
+            self.pet.set_cat_scale(percent)
             self.assertEqual(self.pet.cat_scale, percent)
-            self.assertEqual(self.pet.size_value.text(), f'{percent}%')
+            self.assertIn(f'{percent}%', self.pet.resize_handle.toolTip())
             image = self.pet.cat_label.pixmap()
             self.assertAlmostEqual(image.width() / image.height(), 1208 / 1302, places=2)
             self.assertEqual(image.width(), round(240 * percent / 100))
-            self.assertTrue(self.pet.mask().contains(self.pet.size_control.geometry().center()))
+            self.assertTrue(self.pet.mask().contains(self.pet.resize_handle.geometry().center()))
             self.assertTrue(self.app.primaryScreen().availableGeometry().contains(self.pet.geometry()))
             for button in self.pet.menu.buttons.values():
                 self.assertTrue(self.pet.rect().contains(button.geometry()))
@@ -155,7 +162,7 @@ class PetInteractions(unittest.TestCase):
         original_position = self.pet.pos()
         original_rect = self.pet.cat_label.geometry()
         original_size = self.pet.size()
-        expected = {'Feed': (10, 70, 75), 'Pat': (10, 85, 75), 'Play': (15, 100, 60)}
+        expected = {'Feed': (90, 70, 75), 'Pat': (90, 85, 75), 'Play': (85, 100, 60)}
         for action, values in expected.items():
             self.assertTrue(self.pet.perform_action(action))
             self.assertEqual(tuple(self.pet.status.values.values()), values)
@@ -169,20 +176,20 @@ class PetInteractions(unittest.TestCase):
             self.assertEqual(self.pet.current_state, action)
             self.assertGreater(self.pet.cat_label.progress, 0)
             self.assertTrue(self.pet.effects.items)
-            self.assertFalse(self.pet.size_control.isEnabled())
+            self.assertFalse(self.pet.resize_handle.isEnabled())
             QTest.qWait(self.pet.ACTIONS[action][0] - 250)
             self.assertEqual(self.pet.current_state, 'Idle')
             self.assertEqual(self.pet._asset_path.name, 'cat_idle.png')
             self.assertTrue(self.pet.message.isHidden())
             self.assertFalse(self.pet.effects.items)
-            self.assertTrue(self.pet.size_control.isEnabled())
+            self.assertTrue(self.pet.resize_handle.isEnabled())
             self.assertTrue(all(button.isEnabled() for button in self.pet.menu.buttons.values()))
             self.assertEqual(self.pet.cat_label.pixmap().toImage(), self.pet.sprites.frame('Idle', self.pet.IMAGE_SIZE).toImage())
             self.assertEqual(self.pet.cat_label.geometry(), original_rect)
 
     def test_duplicate_clicks_are_ignored_and_status_updates_live(self):
         self.pet.perform_action('Status')
-        self.assertEqual(self.pet.status.values, {'Hunger': 35, 'Happiness': 65, 'Energy': 75})
+        self.assertEqual(self.pet.status.values, {'Fullness': 65, 'Happiness': 65, 'Energy': 75})
         self.pet.perform_action('Feed')
         self.pet.action_animation.setCurrentTime(500)
         values = dict(self.pet.status.values)
@@ -192,6 +199,8 @@ class PetInteractions(unittest.TestCase):
             self.assertEqual(self.pet.status.values, values)
             self.assertEqual(self.pet.action_animation.currentTime(), 500)
         self.assertTrue(self.pet.perform_action('Status'))
+        self.assertFalse(self.pet.status_panel.isVisible())
+        self.pet.perform_action('Status')
         for name, value in values.items():
             self.assertEqual(self.pet.status_panel.bars[name].value(), value)
             self.assertEqual(self.pet.status_panel.percentages[name].text(), f'{value}%')
@@ -205,7 +214,7 @@ class PetInteractions(unittest.TestCase):
             for _ in range(120):
                 self.pet.status.apply(action)
                 self.assertTrue(all(0 <= value <= 100 for value in self.pet.status.values.values()))
-        self.assertEqual(self.pet.status.values, {'Hunger': 0, 'Happiness': 100, 'Energy': 0})
+        self.assertEqual(self.pet.status.values, {'Fullness': 100, 'Happiness': 100, 'Energy': 0})
 
     def test_effects_move_and_fish_disappears(self):
         self.pet.perform_action('Feed')
@@ -238,6 +247,24 @@ class PetInteractions(unittest.TestCase):
             shutil.copy2(self.pet.sprites.paths['Idle'], idle)
             with self.assertRaisesRegex(FileNotFoundError, 'cat_feed.png'):
                 SpriteLibrary(idle)
+
+    def test_chat_bubble_is_above_cat_and_follows_drag(self):
+        self.open_menu()
+        self.pet.perform_action('Play')
+        cat = self.pet.cat_label.geometry().translated(self.pet.pos())
+        bubble = self.pet.message.geometry()
+        self.assertLess(bubble.center().x(), cat.center().x())
+        self.assertLess(bubble.bottom(), cat.top())
+        self.assertFalse(bubble.intersects(cat))
+        for button in self.pet.menu.buttons.values():
+            self.assertFalse(bubble.intersects(button.geometry().translated(self.pet.pos())))
+        self.assertTrue(self.pet.message.windowFlags() & Qt.WindowType.WindowTransparentForInput)
+        before = self.pet.message.pos()
+        self.pet.move(self.pet.pos() - QPoint(15, 15))
+        self.app.processEvents()
+        self.assertEqual(self.pet.message.pos(), before - QPoint(15, 15))
+        self.pet.action_animation.setCurrentTime(3000)
+        self.assertTrue(self.pet.message.isHidden())
 
     def test_scaled_actions_keep_geometry_and_restore_size(self):
         self.pet.set_cat_scale(125)
@@ -281,18 +308,61 @@ class PetInteractions(unittest.TestCase):
             self.assertFalse(self.pet.geometry().intersects(self.pet.status_panel.geometry()))
             self.assertTrue(area.contains(self.pet.status_panel.geometry()))
 
-    def test_resize_slider_stays_under_pointer_and_keeps_menu_open(self):
+    def test_status_toggle_remains_responsive_and_does_not_move_pet_repeatedly(self):
+        self.pet.perform_action('Status')
+        settled = self.pet.pos()
+        ticks = []
+        heartbeat = QTimer()
+        heartbeat.setInterval(5)
+        heartbeat.timeout.connect(lambda: ticks.append(True))
+        heartbeat.start()
+        for _ in range(12):
+            self.pet.perform_action('Status')
+            self.assertFalse(self.pet.status_panel.isVisible())
+            self.pet.perform_action('Status')
+            self.assertTrue(self.pet.status_panel.isVisible())
+            self.app.processEvents()
+            self.assertEqual(self.pet.pos(), settled)
+        QTest.qWait(80)
+        heartbeat.stop()
+        self.assertGreater(len(ticks), 2)
+
+    def test_resize_handle_drag_scales_whole_menu_and_keeps_hover(self):
         self.open_menu()
-        original = self.pet.size_control.mapToGlobal(QPoint(0, 0))
-        self.pet.size_slider.setSliderDown(True)
-        self.pet.size_slider.setValue(125)
-        self.assertEqual(self.pet.size_control.mapToGlobal(QPoint(0, 0)), original)
+        handle = self.pet.resize_handle
+        anchor = self.pet.mapToGlobal(self.pet.menu.center.toPoint())
+        original_width = self.pet.width()
+        original_button = self.pet.menu.buttons['Feed'].width()
+        original_offset = self.pet.menu.center.x() - self.pet.menu.centers['Pat'][0]
+        local = handle.rect().center()
+        start = handle.mapToGlobal(local)
+        QTest.mousePress(handle, Qt.MouseButton.LeftButton, pos=local)
+        self.assertTrue(handle.dragging)
+        movement = QMouseEvent(QEvent.Type.MouseMove, QPointF(local), QPointF(start + QPoint(25, 25)), Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+        QApplication.sendEvent(handle, movement)
+        self.assertGreater(self.pet.cat_scale, 100)
+        ratio = self.pet.cat_scale / 100
+        self.assertAlmostEqual(self.pet.width() / original_width, ratio, places=2)
+        self.assertAlmostEqual(self.pet.menu.buttons['Feed'].width() / original_button, ratio, places=2)
+        self.assertAlmostEqual((self.pet.menu.center.x() - self.pet.menu.centers['Pat'][0]) / original_offset, ratio, places=2)
+        self.assertLess((self.pet.mapToGlobal(self.pet.menu.center.toPoint()) - anchor).manhattanLength(), 3)
+        self.assertIsNone(self.pet._drag_offset)
         self.point_at(QPoint(-20, -20))
         QTest.qWait(500)
         self.assertTrue(self.pet._menu_active)
-        self.pet.size_slider.setSliderDown(False)
-        self.assertEqual(self.pet.cat_scale, 125)
-        self.assertTrue(self.pet.rect().contains(self.pet.size_control.geometry()))
+        QTest.mouseRelease(handle, Qt.MouseButton.LeftButton, pos=handle.rect().center())
+        self.assertFalse(handle.dragging)
+        self.assertTrue(self.pet.rect().contains(handle.geometry()))
+        self.assertTrue(self.app.primaryScreen().availableGeometry().contains(self.pet.geometry()))
+        # Drag back inward to make the entire group smaller again.
+        local = handle.rect().center()
+        start = handle.mapToGlobal(local)
+        previous = self.pet.cat_scale
+        QTest.mousePress(handle, Qt.MouseButton.LeftButton, pos=local)
+        movement = QMouseEvent(QEvent.Type.MouseMove, QPointF(local), QPointF(start - QPoint(20, 20)), Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+        QApplication.sendEvent(handle, movement)
+        QTest.mouseRelease(handle, Qt.MouseButton.LeftButton, pos=handle.rect().center())
+        self.assertLess(self.pet.cat_scale, previous)
 
     def test_exit_context_menu(self):
         selected = []

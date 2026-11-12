@@ -46,7 +46,7 @@ class SpriteLibrary:
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
             painter.drawPixmap(destination, source, QRectF(source.rect()))
             painter.end()
-        # Bound memory even if the size slider visits every percentage.
+        # Bound memory even if the resize handle visits every percentage.
         if len(self.cache) >= 24:
             self.cache.clear()
         self.cache[key] = result
